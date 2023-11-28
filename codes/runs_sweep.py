@@ -35,7 +35,8 @@ def parse_args(args=None):
     parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
     parser.add_argument('-mw', '--modulus_weight', default=1.0, type=float)
     parser.add_argument('-pw', '--phase_weight', default=0.5, type=float)
-
+    parser.add_argument('-sw', '--sample_weight', default=1.0, type=float)
+    parser.add_argument('-hop', '--hop', default=1, type=int)
     parser.add_argument('-lr', '--learning_rate', default=0.0001, type=float)
     parser.add_argument('-cpu', '--cpu_num', default=10, type=int)
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
@@ -48,6 +49,7 @@ def parse_args(args=None):
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
 
     parser.add_argument('--no_decay', action='store_true', help='Learning rate do not decay')
+    parser.add_argument('--wandb', action='store_true')
     return parser.parse_args(args)
 
 
@@ -65,6 +67,28 @@ def override_config(args):
     args.test_batch_size = args_dict['test_batch_size']
 
 
+def get_wandb_config(args):
+
+    
+    wandb_logger =  wandb.init(project="sweeps_sample")
+
+    args.adversarial_temperature = wandb.config.adversarial_temperature
+    args.batch_size = wandb.config.batch_size
+    args.data_path = wandb.config.data_path
+    args.gamma = wandb.config.gamma
+    args.hidden_dim = wandb.config.hidden_dim
+    args.hop = wandb.config.hop
+    args.learning_rate = wandb.config.learning_rate
+    args.max_steps = wandb.config.max_steps
+    args.model = wandb.config.model
+    args.modulus_weight = wandb.config.modulus_weight
+    args.negative_sample_size = wandb.config.negative_sample_size
+    args.phase_weight = wandb.config.phase_weight
+    args.sample_weight = wandb.config.sample_weight
+    args.test_batch_size = wandb.config.test_batch_size
+    
+    args.save_path = f"../models/{args.model}_{args.data_path.split('/')[-1]}_{args.hop}_{args.sample_weight}"
+    
 def save_model(model, optimizer, save_variable_list, args):
     '''
     Save the parameters of the model and the optimizer,
@@ -140,6 +164,8 @@ def main(args):
 
     if args.init_checkpoint:
         override_config(args)
+    elif args.wandb:
+        get_wandb_config(args)
     elif args.data_path is None:
         raise ValueError('one of init_checkpoint/data_path must be choosed.')
 

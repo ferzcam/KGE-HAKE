@@ -124,10 +124,105 @@ class KGEModel(nn.Module, ABC):
             raise ValueError('batch_type %s not supported!'.format(batch_type))
 
         # return scores
+
         return self.func(head, relation, tail, batch_type)
 
+
+    def sampling_score(self, sample, trans_rels, batch_type=BatchType.SINGLE):
+        """
+        Given the indexes in `sample`, extract the corresponding embeddings,
+        and call func().
+
+        Args:
+            batch_type: {SINGLE, HEAD_BATCH, TAIL_BATCH},
+                - SINGLE: positive samples in training, and all samples in validation / testing,
+                - HEAD_BATCH: (?, r, t) tasks in training,
+                - TAIL_BATCH: (h, r, ?) tasks in training.
+
+            sample: different format for different batch types.
+                - SINGLE: tensor with shape [batch_size, 3]
+                - {HEAD_BATCH, TAIL_BATCH}: (positive_sample, negative_sample)
+                    - positive_sample: tensor with shape [batch_size, 3]
+                    - negative_sample: tensor with shape [batch_size, negative_sample_size]
+        """
+        if batch_type == BatchType.SINGLE:
+            filter_ = torch.tensor(trans_rels).to(sample.device)
+            mask = sample[:, 1].unsqueeze(1) == filter_.unsqueeze(0)
+            mask = mask.any(dim=1)
+            sample = sample[mask]
+                        
+            head = torch.index_select(
+                self.entity_embedding,
+                dim=0,
+                index=sample[:, 0]
+            ).unsqueeze(1)
+
+            relation = torch.index_select(
+                self.relation_embedding,
+                dim=0,
+                index=sample[:, 1]
+            ).unsqueeze(1)
+
+            tail = torch.index_select(
+                self.entity_embedding,
+                dim=0,
+                index=sample[:, 2]
+            ).unsqueeze(1)
+
+        # elif batch_type == BatchType.HEAD_BATCH:
+            # tail_part, head_part = sample
+            # batch_size, negative_sample_size = head_part.size(0), head_part.size(1)
+
+            # head = torch.index_select(
+                # self.entity_embedding,
+                # dim=0,
+                # index=head_part.view(-1)
+            # ).view(batch_size, negative_sample_size, -1)
+
+            # relation = torch.index_select(
+                # self.relation_embedding,
+                # dim=0,
+                # index=tail_part[:, 1]
+            # ).unsqueeze(1)
+
+            # tail = torch.index_select(
+                # self.entity_embedding,
+                # dim=0,
+                # index=tail_part[:, 2]
+            # ).unsqueeze(1)
+
+        # elif batch_type == BatchType.TAIL_BATCH:
+            # head_part, tail_part = sample
+            # batch_size, negative_sample_size = tail_part.size(0), tail_part.size(1)
+
+            # head = torch.index_select(
+                # self.entity_embedding,
+                # dim=0,
+                # index=head_part[:, 0]
+            # ).unsqueeze(1)
+
+            # relation = torch.index_select(
+                # self.relation_embedding,
+                # dim=0,
+                # index=head_part[:, 1]
+            # ).unsqueeze(1)
+
+            # tail = torch.index_select(
+                # self.entity_embedding,
+                # dim=0,
+                # index=tail_part.view(-1)
+            # ).view(batch_size, negative_sample_size, -1)
+
+        else:
+            raise ValueError('batch_type %s not supported!'.format(batch_type))
+
+        # return scores
+
+        return self.sample_func(head, relation, tail, batch_type)
+                    
+        
     @staticmethod
-    def train_step(model, optimizer, train_iterator, args):
+    def train_step(model, optimizer, train_iterator, args, trans_rels = None):
         '''
         A single train step. Apply back-propation and return the loss
         '''
@@ -156,7 +251,27 @@ class KGEModel(nn.Module, ABC):
         positive_sample_loss = - (subsampling_weight * positive_score).sum() / subsampling_weight.sum()
         negative_sample_loss = - (subsampling_weight * negative_score).sum() / subsampling_weight.sum()
 
-        loss = (positive_sample_loss + negative_sample_loss) / 2
+
+        if not trans_rels is None:
+            filter_ = torch.tensor(trans_rels).to(positive_sample.device)
+            mask = positive_sample[:, 1].unsqueeze(1) == filter_.unsqueeze(0)
+            mask = mask.any(dim=1)
+            # print(f"Subsampling weight shape: {subsampling_weight.shape}")
+            # print(f"mask shape: {mask.shape}")
+            subsampling_weight = subsampling_weight[mask]
+            # assert subsampling_weight.sum() != 0, subsampling_weight
+            # print(f"Subsampling weight shape: {subsampling_weight.shape}")
+                        
+            sample_score = model.sampling_score(positive_sample, trans_rels)
+            sample_score = F.logsigmoid(sample_score).squeeze(dim=1)
+            # print(sample_score)
+            sample_loss = - (subsampling_weight * sample_score).sum()# / subsampling_weight.sum()
+
+            loss = (positive_sample_loss + negative_sample_loss + sample_loss) / 3
+
+        else:
+            sample_loss = torch.tensor(0)
+            loss = (positive_sample_loss + negative_sample_loss) / 2
 
         loss.backward()
 
@@ -165,6 +280,7 @@ class KGEModel(nn.Module, ABC):
         log = {
             'positive_sample_loss': positive_sample_loss.item(),
             'negative_sample_loss': negative_sample_loss.item(),
+            'sample_loss': sample_loss.item(),
             'loss': loss.item()
         }
 
@@ -334,7 +450,7 @@ class HAKE(KGEModel):
 
         self.phase_weight = nn.Parameter(torch.Tensor([[phase_weight * self.embedding_range.item()]]))
         self.modulus_weight = nn.Parameter(torch.Tensor([[modulus_weight]]))
-
+        
         self.pi = 3.14159262358979323846
 
 
@@ -363,4 +479,45 @@ class HAKE(KGEModel):
         r_score = torch.norm(r_score, dim=2) * self.modulus_weight
 
         return self.gamma.item() - (phase_score + r_score)
+
+
+class SamplE(HAKE):
+    def __init__(self, hop, *args, **kwargs):
+        super(SamplE, self).__init__(*args, **kwargs)
+        self.hop = hop
+        self.sample_weight = nn.Parameter(torch.Tensor([[1.0]]))
+
+    def sample_func(self, head, rel, tail, batch_type):
+        hop_vector = torch.randint(2, self.hop, (head.shape[0],)).unsqueeze(-1).unsqueeze(-1).to(head.device)
         
+        phase_head, mod_head = torch.chunk(head, 2, dim=2)
+        phase_relation, mod_relation, bias_relation = torch.chunk(rel, 3, dim=2)
+
+        phase_head = phase_head / (self.embedding_range.item() / self.pi)
+        phase_relation = phase_relation / (self.embedding_range.item() / self.pi)
+        
+        # print(f"hop vector shape: {hop_vector.shape}")
+        # print(f"phase_relation shape: {phase_relation.shape}")
+        sampled_phase_tail = phase_head + hop_vector * phase_relation
+        # sampled_phase_tail = sampled_phase_tail  / (self.embedding_range.item() / self.pi)
+
+        if batch_type == BatchType.HEAD_BATCH:
+            phase_score = phase_head + phase_relation  - sampled_phase_tail 
+        else:
+            phase_score = phase_head + phase_relation  - sampled_phase_tail
+        
+        mod_relation = torch.abs(mod_relation)
+        bias_relation = torch.clamp(bias_relation, max=1)
+        indicator = (bias_relation < -mod_relation)
+        bias_relation[indicator] = -mod_relation[indicator]
+
+        # sampled_mod_tail = mod_head * (mod_relation + bias_relation)**hop_vector
+        sampled_mod_tail = mod_head * ((mod_relation * bias_relation)/(1-bias_relation))**hop_vector
+        
+        r_score = mod_head * (mod_relation + bias_relation) - sampled_mod_tail * (1 - bias_relation)
+        phase_score = torch.sum(torch.abs(torch.sin(phase_score / 2)), dim=2) * self.phase_weight
+        r_score = torch.norm(r_score, dim=2) * self.modulus_weight
+
+        # return (self.gamma.item() - (phase_score + r_score)) * self.sample_weight
+        return self.gamma.item() - (phase_score + r_score)*self.sample_weight
+    
