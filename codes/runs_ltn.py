@@ -8,11 +8,11 @@ import torch
 
 from torch.utils.data import DataLoader
 
-from models import KGEModel, ModE, HAKE
+from models import KGEModel, ModE, HAKE, SamplE
 
 from data import TrainDataset, BatchType, ModeType, DataReader
 from data import BidirectionalOneShotIterator
-
+import wandb
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
@@ -97,7 +97,7 @@ def save_model(model, optimizer, save_variable_list, args):
 
 def set_logger(args):
     '''
-    Write logs to checkpoint and console
+    Write logs to checkpoint, console and wandb
     '''
 
     if args.do_train:
@@ -119,12 +119,19 @@ def set_logger(args):
     logging.getLogger('').addHandler(console)
 
 
+    group_name = args.data_path.split('/')[-1] + '_' + args.model
+    wandb.init(project='sample_new', group=group_name)
+    
+
 def log_metrics(mode, step, metrics):
     '''
     Print the evaluation logs
     '''
     for metric in metrics:
         logging.info('%s %s at step %d: %f' % (mode, metric, step, metrics[metric]))
+
+    metrics = {f"{mode}_{metric}": metrics[metric] for metric in metrics}
+    wandb.log(metrics, step=step)
 
 
 def main(args):
@@ -142,10 +149,20 @@ def main(args):
     if args.save_path and not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
 
-    # Write logs to checkpoint and console
+    # Write logs to checkpoint and console and return wandb logger
     set_logger(args)
 
     data_reader = DataReader(args.data_path)
+
+    relation_dict = data_reader.relation_dict
+    if "wn18rr" in args.data_path:
+        assert relation_dict['_hypernym'] == 0, f"Hypernym relation must be 0, but got {relation_dict['_hypernym']}"
+        assert relation_dict['_has_part'] == 6, f"Has_part relation must be 7, but got {relation_dict['_has_part']}"
+        trans_rels = [0, 6]
+
+    
+    
+    
     num_entity = len(data_reader.entity_dict)
     num_relation = len(data_reader.relation_dict)
 
@@ -160,9 +177,16 @@ def main(args):
 
     if args.model == 'ModE':
         kge_model = ModE(num_entity, num_relation, args.hidden_dim, args.gamma)
+        trans_rels = None
     elif args.model == 'HAKE':
         kge_model = HAKE(num_entity, num_relation, args.hidden_dim, args.gamma, args.modulus_weight, args.phase_weight)
-
+        trans_rels = None
+    elif args.model == 'SamplE':
+        kge_model = SamplE(5, num_entity, num_relation, args.hidden_dim, args.gamma, args.modulus_weight, args.phase_weight)
+    else:
+        raise ValueError('model %s not supported' % args.model)
+    
+        
     logging.info('Model Parameter Configuration:')
     for name, param in kge_model.named_parameters():
         logging.info('Parameter %s: %s, require_grad = %s' % (name, str(param.size()), str(param.requires_grad)))
@@ -229,7 +253,7 @@ def main(args):
         # Training Loop
         for step in range(init_step, args.max_steps):
 
-            log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
+            log = kge_model.train_step(kge_model, optimizer, train_iterator, args, trans_rels)
 
             training_logs.append(log)
 

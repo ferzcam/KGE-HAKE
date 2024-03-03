@@ -8,11 +8,11 @@ import torch
 
 from torch.utils.data import DataLoader
 
-from models import KGEModel, ModE, HAKE
+from models import KGEModel, ModE, HAKE, SamplE
 
 from data import TrainDataset, BatchType, ModeType, DataReader
 from data import BidirectionalOneShotIterator
-
+import wandb
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
@@ -35,7 +35,8 @@ def parse_args(args=None):
     parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
     parser.add_argument('-mw', '--modulus_weight', default=1.0, type=float)
     parser.add_argument('-pw', '--phase_weight', default=0.5, type=float)
-
+    parser.add_argument('-sw', '--sample_weight', default=1.0, type=float)
+    parser.add_argument('-hop', '--hop', default=1, type=int)
     parser.add_argument('-lr', '--learning_rate', default=0.0001, type=float)
     parser.add_argument('-cpu', '--cpu_num', default=10, type=int)
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
@@ -48,6 +49,7 @@ def parse_args(args=None):
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
 
     parser.add_argument('--no_decay', action='store_true', help='Learning rate do not decay')
+    parser.add_argument('--wandb', action='store_true')
     return parser.parse_args(args)
 
 
@@ -65,6 +67,28 @@ def override_config(args):
     args.test_batch_size = args_dict['test_batch_size']
 
 
+def get_wandb_config(args):
+
+    
+    wandb_logger =  wandb.init(project="sweeps_sample")
+
+    args.adversarial_temperature = wandb.config.adversarial_temperature
+    args.batch_size = wandb.config.batch_size
+    args.data_path = wandb.config.data_path
+    args.gamma = wandb.config.gamma
+    args.hidden_dim = wandb.config.hidden_dim
+    args.hop = wandb.config.hop
+    args.learning_rate = wandb.config.learning_rate
+    args.max_steps = wandb.config.max_steps
+    args.model = wandb.config.model
+    args.modulus_weight = wandb.config.modulus_weight
+    args.negative_sample_size = wandb.config.negative_sample_size
+    args.phase_weight = wandb.config.phase_weight
+    args.sample_weight = wandb.config.sample_weight
+    args.test_batch_size = wandb.config.test_batch_size
+    
+    args.save_path = f"../models/{args.model}_{args.data_path.split('/')[-1]}_{args.hop}_{args.gamma}_{args.hidden_dim}_{args.learning_rate}_{args.max_steps}"
+    
 def save_model(model, optimizer, save_variable_list, args):
     '''
     Save the parameters of the model and the optimizer,
@@ -97,7 +121,7 @@ def save_model(model, optimizer, save_variable_list, args):
 
 def set_logger(args):
     '''
-    Write logs to checkpoint and console
+    Write logs to checkpoint, console and wandb
     '''
 
     if args.do_train:
@@ -119,12 +143,19 @@ def set_logger(args):
     logging.getLogger('').addHandler(console)
 
 
+    group_name = args.data_path.split('/')[-1] + '_' + args.model
+    wandb.init(project='sample_new', group=group_name)
+    
+
 def log_metrics(mode, step, metrics):
     '''
     Print the evaluation logs
     '''
     for metric in metrics:
         logging.info('%s %s at step %d: %f' % (mode, metric, step, metrics[metric]))
+
+    metrics = {f"{mode}_{metric}": metrics[metric] for metric in metrics}
+    wandb.log(metrics, step=step)
 
 
 def main(args):
@@ -133,6 +164,8 @@ def main(args):
 
     if args.init_checkpoint:
         override_config(args)
+    elif args.wandb:
+        get_wandb_config(args)
     elif args.data_path is None:
         raise ValueError('one of init_checkpoint/data_path must be choosed.')
 
@@ -142,10 +175,20 @@ def main(args):
     if args.save_path and not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
 
-    # Write logs to checkpoint and console
+    # Write logs to checkpoint and console and return wandb logger
     set_logger(args)
 
     data_reader = DataReader(args.data_path)
+
+    relation_dict = data_reader.relation_dict
+    if "wn18rr" in args.data_path:
+        assert relation_dict['_hypernym'] == 0, f"Hypernym relation must be 0, but got {relation_dict['_hypernym']}"
+        assert relation_dict['_has_part'] == 6, f"Has_part relation must be 7, but got {relation_dict['_has_part']}"
+        trans_rels = [0, 6]
+
+    
+    
+    
     num_entity = len(data_reader.entity_dict)
     num_relation = len(data_reader.relation_dict)
 
@@ -160,9 +203,16 @@ def main(args):
 
     if args.model == 'ModE':
         kge_model = ModE(num_entity, num_relation, args.hidden_dim, args.gamma)
+        trans_rels = None
     elif args.model == 'HAKE':
         kge_model = HAKE(num_entity, num_relation, args.hidden_dim, args.gamma, args.modulus_weight, args.phase_weight)
-
+        trans_rels = None
+    elif args.model == 'SamplE':
+        kge_model = SamplE(args.hop, num_entity, num_relation, args.hidden_dim, args.gamma, args.modulus_weight, args.phase_weight)
+    else:
+        raise ValueError('model %s not supported' % args.model)
+    
+        
     logging.info('Model Parameter Configuration:')
     for name, param in kge_model.named_parameters():
         logging.info('Parameter %s: %s, require_grad = %s' % (name, str(param.size()), str(param.requires_grad)))
@@ -229,7 +279,7 @@ def main(args):
         # Training Loop
         for step in range(init_step, args.max_steps):
 
-            log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
+            log = kge_model.train_step(kge_model, optimizer, train_iterator, args, trans_rels)
 
             training_logs.append(log)
 
